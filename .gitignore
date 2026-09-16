@@ -42,6 +42,10 @@ vignettes/*.pdf
 # pkgdown site
 docs/
 
+# Figures and Tables folders
+Figures
+Tables
+
 # translation temp files
 po/*~
 
