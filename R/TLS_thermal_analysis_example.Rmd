@@ -1,0 +1,604 @@
+---
+title: "Example thermal-tolerance (TLS) analysis from Fv/Fm heat-stress data"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE,
+                      warning = TRUE, fig.width = 8, fig.height = 6)
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(freqTLS)
+library(kableExtra)
+
+theme_set(theme_bw())
+```
+
+## Purpose
+
+This notebook fits thermal load sensitivity (TLS) dose-response curves to heat-stress
+Fv/Fm data using `freqTLS`, to complement the Fv/Fm extraction pipeline
+(`FvFm_pipeline.py` / `FvFm_GUI.py`) in this repo. `FvFm_auto` (this repo's
+automated Fo/Fm extraction) was used to generate the source values throughout.
+
+It runs on `Data/tls_example_deidentified.csv` — a minimal, de-identified
+dataset prepared from the fuller raw source data specifically so this example
+can ship alongside the publication without the raw file's identifying
+columns. See [Data provenance] for exactly how it was derived. Samples with
+a pre-heat baseline Fv/Fm below 0.5 (not a "healthy" initial PSII state) were
+already excluded during that preparation.
+
+Species identity is de-identified throughout: `sp_id` (`SP1`–`SP5`) is
+derived from `sp`, and `plant_id` is a simple per-species sequential code
+(`SP1_1`, `SP1_2`, ...).
+
+Threshold temperatures below follow the TDT convention: TX is
+the temperature at which X% of the PSII function has been lost — so
+**T90 is a harsher condition than T10** (90% vs. 10% decline). CTmax is a
+related but distinct quantity: the curve's own *relative* midpoint,
+`(low + up) / 2`, not a fixed absolute percentage — see
+[Threshold temperatures (TX)].
+
+The response variable itself — absolute Fv/Fm vs Fv/Fm expressed as a
+proportion of each plant's own pre-heat baseline — is a modelling
+choice with different implications for cross-species comparison; see
+[Response variable: proportional vs. absolute Fv/Fm] for the reasoning
+behind using the proportional response as the primary analysis here, with
+absolute Fv/Fm retained as a comparison.
+
+## Data provenance
+
+This chunk is not re-run here (`eval=FALSE`) — it documents exactly how
+`Data/tls_example_deidentified.csv` was produced from the raw source file.
+
+```{r provenance, eval=FALSE}
+raw <- read.csv("Data/subset_fvfm_doses.csv", stringsAsFactors = FALSE)
+
+dat <- raw |>
+  mutate(sp_id = paste0("SP", as.integer(factor(sp, levels = sort(unique(sp)))))) |>
+  group_by(sp_id) |>
+  mutate(plant_id = paste0(sp_id, "_", dense_rank(paste(chamber, ch_rep, Rep)))) |>
+  ungroup() |>
+  transmute(
+    sp_id, plant_id,
+    temp_C = Temp,
+    time_min = Time,
+    FvFm_initial = initial_fvfm,  # pre-heat baseline
+    FvFm_post    = post_fvfm,     # 2h post-heat
+    FvFm_final   = final_fvfm     # 24h / overnight
+  ) |>
+  filter(FvFm_initial >= 0.5)
+
+write.csv(dat, "Data/tls_example_deidentified.csv", row.names = FALSE)
+```
+
+## Load and prepare data
+
+```{r load-data}
+dat <- read.csv("Data/tls_example_deidentified.csv", stringsAsFactors = FALSE)
+glimpse(dat)
+
+dur_breaks <- sort(unique(dat$time_min))
+```
+
+### Baseline QC
+
+```{r qc-baseline}
+dat |>
+  group_by(sp_id) |>
+  summarise(mean_i = mean(FvFm_initial), sd_i = sd(FvFm_initial), n = n(), .groups = "drop")
+```
+
+```{r qc-baseline-plot}
+ggplot(dat, aes(temp_C, FvFm_initial, colour = sp_id)) +
+  geom_jitter(width = 1, alpha = 0.4, size = 1) +
+  scale_colour_viridis_d(option = "mako", end = 0.8) +
+  labs(x = "Assigned temperature (°C)", y = "Baseline Fv/Fm", colour = "Species")
+```
+
+Baseline Fv/Fm is flat across assigned treatment, as expected — the pre-heat
+baseline shouldn't depend treatment because it hasn't been applied yet.
+Samples with baseline Fv/Fm below 0.5 were removed during data preparation 
+(see [Data provenance]), so the minimum here is 0.5 by construction. Samples
+vary within a healthy range (SD 0.02–0.06 per species, and species means 
+differ by up to ~0.07). Likely this is a combination of biological variation, 
+and leaf-to-leaf handling during sampling (e.g. how/where a disc is cut).
+
+## Response variable: proportional vs. absolute Fv/Fm
+
+Two ways to define the survival response for the same underlying data:
+
+- **Absolute Fv/Fm** at 24h (or 2h) — used directly as the TLS response.
+- **Proportional Fv/Fm** — that same reading divided by the plant's own
+  pre-heat baseline (`FvFm_final / FvFm_initial`), i.e. the fraction of
+  *that individual's own* capacity retained.
+
+There are three considerations for these data:
+
+1. **Sample-to-sample baseline variance.** The baseline QC above shows real
+   spread in pre-heat Fv/Fm, both within and between species, plausibly
+   including handling/cutting artefacts rather than biology. Absolute
+   Fv/Fm at 24h carries that noise into the response; dividing by each 
+   plant's own baseline removes it, at the cost of also propagating any
+   noise in the baseline reading itself multiplicatively into the ratio.
+   With species means differing by up to ~0.07 here, this could be large.
+2. **`up` identifiability.** `freqTLS`'s own diagnostics (`check_tls()`)
+   flag the upper asymptote as unreliable when the maximum observed
+   survival in the data doesn't get close to 1 (in practice, needs to
+   approach roughly 0.8+) — and that requirement gets harder to satisfy
+   once `up` is allowed to vary *by species*, since each species-specific
+   ceiling then needs its own near-undamaged observations. Absolute Fv/Fm
+   tops out near ~0.8 by definition (close to a healthy leaf's maximum), 
+   so `up` sits under the useful range for any per-species asymptote. 
+   Dividing by each plant's own baseline rescales the *achievable* ceiling 
+   to ~1 for every plant, which should make `up` (and any per-species version 
+   of it) far better identified in the fitted models.
+3. **Field of research familiarity.** Most people who work with chlorophyll
+   fluorescence think in terms of raw Fv/Fm on its conventional ~0–0.85
+   scale, not a 0–1 proportion of baseline term. Therefore, we retain absolute
+   Fv/Fm on the raw data scale as a secondary analysis.
+
+Given (1) and (2), the proportional response is used as the primary
+analysis from here on; absolute Fv/Fm is refit with the same model
+structure as a comparison once that structure is established through 
+model selection.
+
+```{r prep-primary}
+o_dat <- dat |>
+  mutate(prop_final = FvFm_final / FvFm_initial)
+
+cat("prop_final range:", range(o_dat$prop_final), " | n == 0:", sum(o_dat$prop_final == 0),
+    " | n > 1:", sum(o_dat$prop_final > 1), "\n")
+
+o_dat <- o_dat |>
+  mutate(prop_clamped = pmin(pmax(prop_final, 1e-4), 1 - 1e-4))
+```
+
+Unlike the absolute response (floored only, since it can't exceed ~0.85),
+the proportional response needs clamping at **both** ends. It can hit exactly
+0 (complete damage after 24 h) and can slightly exceed 1 (a leaf tissue sample
+reading marginally higher at 24 h than its own pre-heat baseline — typically 
+measurement noise, not real biology).
+
+## Design & replication check
+
+```{r replication-check}
+dat |> distinct(sp_id, plant_id) |> count(sp_id, name = "n_individuals")
+
+dat |>
+  count(temp_C, time_min) |>
+  pivot_wider(names_from = time_min, values_from = n) |>
+  arrange(temp_C)
+```
+
+Each species has 6–7 individual plants, each measured across almost the
+full 7 (temperature) x 5 (duration) grid — a median of 6 individuals per
+species at any given treatment cell (the 30°C and 56°C edges, and the
+120-minute column above 44°C, are intentionally reduced, since those
+combinations are the least informative).
+
+Each individual plant also contributes ~28 rows here (one row per treatment
+thermal load it was measured at) — those are repeated measurements on the 
+same physical plant, not independent samples, so a random intercept per
+`plant_id` is still needed underneath the species fixed effect to avoid
+pseudo-replication.
+
+## Choosing a model structure
+
+Following the standard workflow, model structure is decided by comparison,
+not assumption. `t_ref = 60` minutes throughout; `method = "wald"` for fast
+exploratory intervals. Switch to `"profile"`/`"bootstrap"` for a more robust
+statistical model fit, but expect compute time to significantly increase.
+
+A few candidate models are fitted to determine the appropriate structure, 
+and these are evaluated using Akaike's Information Criterion (AIC).
+
+```{r standardize}
+dat_std <- standardize_data(
+  o_dat, temp = "temp_C", duration = "time_min", proportion = "prop_clamped",
+  duration_unit = "minutes", random_effects = c("sp_id", "plant_id")
+)
+```
+
+```{r model-comparison}
+fit_pop      <- fit_4pl(dat_std, family = "beta", t_ref = 60, method = "wald", quiet = TRUE)
+fit_sp_re    <- fit_4pl(dat_std, ctmax = ~1 + (1|sp_id), z = ~1 + (1|sp_id),
+                         family = "beta", t_ref = 60, method = "wald", quiet = TRUE)
+fit_sp_fix   <- fit_4pl(dat_std, ctmax = ~0 + sp_id, z = ~0 + sp_id,
+                         family = "beta", t_ref = 60, method = "wald", quiet = TRUE)
+fit_sp_plant <- suppressWarnings(fit_4pl(dat_std, ctmax = ~0 + sp_id + (1|plant_id), z = ~0 + sp_id,
+                         family = "beta", t_ref = 60, method = "wald", quiet = TRUE))
+fit_sp_up    <- suppressWarnings(fit_4pl(dat_std, ctmax = ~0 + sp_id + (1|plant_id), z = ~0 + sp_id,
+                         up = ~0 + sp_id, family = "beta", t_ref = 60, method = "wald", quiet = TRUE))
+
+tibble::tibble(
+  model = c("population only", "species random intercept", "species fixed effect",
+            "+ plant random intercept (CTmax)", "+ up varying by species"),
+  AIC   = c(AIC(fit_pop$fit), AIC(fit_sp_re$fit), AIC(fit_sp_fix$fit),
+            AIC(fit_sp_plant$fit), AIC(fit_sp_up$fit))
+) |> arrange(AIC)
+```
+
+Species matters a great deal, a **fixed** species effect is more appropriate 
+than a random intercept given the replication here, and the `plant_id` random 
+intercept matters too, given the repeated-measures structure. Unlike the 
+absolute Fv/Fm version of this model (see [Comparison with absolute Fv/Fm]), 
+a `plant_id` random intercept on `z` as well as `CTmax` does **not** converge 
+here (`NA/NaN gradient`) — so `z` stays fixed-by-species only.
+
+Note that this model structure protects `CTmax` from pseudo-replication but `z` 
+has no plant_id term (the model did not converge), so its standard errors 
+implicitly assume each plant's repeated measurements are independent for curve 
+steepness. Any real plant-to-plant variation in `z` is absorbed into the 
+residual dispersion (`phi`) rather than properly partitioned out, likely 
+reducing `z`'s' reported uncertainty.
+
+**Explore whether `k` or `low` should vary by species** 
+
+```{r shape-by-species-test}
+fit_sp_k   <- suppressWarnings(fit_4pl(dat_std, ctmax = ~0+sp_id+(1|plant_id), z = ~0+sp_id,
+                     k = ~0+sp_id, family = "beta", t_ref = 60, method = "wald", quiet = TRUE))
+fit_sp_low <- suppressWarnings(fit_4pl(dat_std, ctmax = ~0+sp_id+(1|plant_id), z = ~0+sp_id,
+                     low = ~0+sp_id, family = "beta", t_ref = 60, method = "wald", quiet = TRUE))
+fit_sp_upk <- suppressWarnings(fit_4pl(dat_std, ctmax = ~0+sp_id+(1|plant_id), z = ~0+sp_id,
+                     up = ~0+sp_id, k = ~0+sp_id, family = "beta", t_ref = 60, method = "wald", quiet = TRUE))
+
+tibble::tibble(
+  model = c("up only (adopted)", "k only", "low only", "up + k together"),
+  AIC   = c(AIC(fit_sp_up$fit), AIC(fit_sp_k$fit), AIC(fit_sp_low$fit), AIC(fit_sp_upk$fit))
+) |> arrange(AIC)
+```
+
+`k` and `low` varying individually give no material AIC improvement over
+`up` alone. `up` is the one shape parameter worth letting vary by species;
+`k` and `low` stay shared. This is the direct CTmax/z parameterisation 
+(not a reduced or reparameterised form), which — with this design (5 
+species x 6–7 plants x a near-full temperature x duration grid) —
+recovers real per-species differences in the quantities of scientific
+interest without over-fitting the harder-to-identify shape parameters.
+
+```{r fit-final}
+fit_sp <- fit_sp_up
+check_tls(fit_sp)
+```
+
+There are no diagnostic warnings: the proportional response resolves the
+`up_not_approached` warning that the absolute-response model triggers 
+(see [Comparison with absolute Fv/Fm]), simply by rescaling every 
+plant's achievable ceiling to ~1 instead of ~0.85.
+
+### Model summary
+
+```{r summary-final}
+summary(fit_sp)
+```
+
+Reading this table:
+
+- **`low`** — shared floor survival (the residual signal in completely
+  destroyed tissue), on the natural (0–1) scale.
+- **`up:SPx`** — each species' own undamaged ceiling, expressed as a
+  proportion of that species' own baseline.
+- **`k`** — shared steepness of the decline (log10-time scale).
+- **`CTmax:SPx`** — each species' relative-midpoint threshold temperature
+  (°C) at `t_ref = 60` min — the headline dose-response quantity. Under the
+  proportional response this is "the temperature at which a species has
+  lost half the distance between its own floor and its own ceiling".
+- **`z:SPx`** — each species' thermal sensitivity (°C per 10x change in
+  exposure duration).
+- **`phi`** — Beta-distribution dispersion (precision) parameter.
+- **`sigma_CTmax`** — the estimated `plant_id` random-intercept standard
+  deviation: how much individual plants vary around their species' `CTmax`
+  (°C), after accounting for species and treatment.
+
+```{r summary-table-reportable}
+summary(fit_sp)$coefficients |>
+  mutate(
+    Parameter = sub(":.*$", "", parameter),
+    Species   = ifelse(is.na(group), "—", group),
+    Estimate  = sprintf("%.3f", estimate),
+    SE        = sprintf("%.3f", std.error),
+    `z value` = sprintf("%.2f", statistic),
+    `p value` = ifelse(p.value < 0.001, "< 0.001", sprintf("%.3f", p.value))
+  ) |>
+  select(Parameter, Species, Estimate, SE, `z value`, `p value`) |>
+  kbl(align = "llrrrr",
+      caption = "Fitted 4PL parameters — primary model (proportional Fv/Fm response)") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE)
+```
+
+### Headline quantities, per species
+
+```{r tls-species}
+tls(fit_sp, by = "sp_id", method = "wald")$summary |>
+  pivot_wider(names_from = quantity, values_from = c(median, lower, upper))
+```
+
+```{r get-shape}
+get_shape(fit_sp)  # low/k/phi only — up is per-species now, see summary() above
+```
+
+### Threshold temperatures (TX)
+
+```{r derive-thresholds}
+thresholds <- map_dfr(paste0("SP", 1:5), function(s) {
+  tibble::tibble(
+    sp_id = s,
+    T50 = suppressWarnings(derive_ctmax(fit_sp, surv = 0.5, group = s)),
+    T90 = suppressWarnings(derive_ctmax(fit_sp, surv = 0.1, group = s))
+  )
+})
+thresholds
+```
+
+### Plots
+
+```{r plot-primary-curves}
+plot_survival_curves(fit_sp) +
+  scale_x_log10(breaks = dur_breaks) +
+  labs(title = NULL, subtitle = NULL,
+       x = "Exposure duration (min, log10 scale)",
+       y = "Fv/Fm proportion of baseline (24h / initial)")
+```
+
+```{r plot-primary-surface}
+plot_survival_surface(fit_sp, temps = seq(35, 50, 0.5)) +
+  scale_y_log10(breaks = dur_breaks) +
+  labs(title = NULL, subtitle = NULL,
+       y = "Exposure duration (min, log10 scale)",
+       fill = "Proportion\nof baseline\n(24h)")
+```
+
+### Time to T50, per species
+
+```{r plot-tdt-curve-50}
+suppressWarnings(plot_tdt_curve(fit_sp, p = 0.5, temps = seq(40, 52, length.out = 100))) +
+  scale_y_log10(breaks = c(1, 5, 15, 30, 60, 120, 240, 480)) +
+  labs(title = NULL, subtitle = NULL, colour = "Species",
+       y = "Time to T50 (min, log10 scale)",
+       caption = "Duration at which fitted Fv/Fm (24h, proportion of baseline) crosses 50% absolute survival, per species/temperature.")
+```
+
+Temperatures below 40°C are excluded for plotting these: at milder 
+conditions the model's implied time-to-T50 extrapolates to durations
+far beyond the tested window.
+
+### Time to T90, per species
+
+```{r plot-tdt-curve-90}
+suppressWarnings(plot_tdt_curve(fit_sp, p = 0.1, temps = seq(40, 52, length.out = 100))) +
+  scale_y_log10(breaks = c(1, 5, 15, 30, 60, 120, 240, 480)) +
+  labs(title = NULL, subtitle = NULL, colour = "Species",
+       y = "Time to T90 (min, log10 scale)",
+       caption = "Duration at which fitted Fv/Fm (24h, proportion of baseline) crosses 90% absolute survival, per species/temperature.")
+```
+
+Temperatures below 40°C are excluded for plotting these: at milder 
+conditions the model's implied time-to-T50 extrapolates to durations
+far beyond the tested window.
+
+## Comparison with absolute Fv/Fm
+
+The same model structure (`ctmax = ~0+sp_id+(1|plant_id)`, `z = ~0+sp_id`,
+`up = ~0+sp_id`), refit to absolute `FvFm_final` instead. This is a directly
+comparable check of whether the response-variable choice changes conclusions.
+
+```{r fit-absolute-comparison}
+abs_dat <- dat |> mutate(FvFm_clamped = pmax(FvFm_final, 1e-4))
+dat_std_abs <- standardize_data(abs_dat, temp = "temp_C", duration = "time_min", proportion = "FvFm_clamped",
+                                 duration_unit = "minutes", random_effects = c("sp_id", "plant_id"))
+fit_abs <- suppressWarnings(fit_4pl(dat_std_abs, ctmax = ~0+sp_id+(1|plant_id), z = ~0+sp_id, up = ~0+sp_id,
+                    family = "beta", t_ref = 60, method = "wald", quiet = TRUE))
+check_tls(fit_abs)
+```
+
+The absolute-response model **does** trigger `up_not_approached` warning.
+
+```{r compare-abs-prop}
+cmp <- bind_rows(
+  tls(fit_sp,  by = "sp_id", method = "wald")$summary |> mutate(response = "Proportional (final/initial)"),
+  tls(fit_abs, by = "sp_id", method = "wald")$summary |> mutate(response = "Absolute Fv/Fm (24h)")
+) |> filter(quantity == "CTmax")
+
+cmp |> select(sp_id, response, median, lower, upper) |>
+  pivot_wider(names_from = response, values_from = c(median, lower, upper))
+
+ggplot(cmp, aes(sp_id, median, colour = response)) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), position = position_dodge(width = 0.4)) +
+  labs(x = "Species", y = "CTmax (°C)", colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+`CTmax` estimates and species ranking are essentially unchanged from the
+proportional to the absolute approach (largest shift ~0.4°C, well inside 
+every CI; Spearman rank correlation = 1). The response variable choice 
+here does not change which species is more or less heat tolerant — but it
+does change the model fits and exact interpretation of the parameters.
+
+## Acute post-heat (2h) curve
+
+The same model selection logic applied to the 2 h measurements, as a 
+secondary comparison against the 24 h measurements. Under the proportional 
+response, the 2 h data support exactly the same structure as the 24 h data.
+The absolute response version, needs a reduced structure for the 2 h data.
+
+```{r fit-secondary}
+p_dat <- dat |>
+  mutate(prop_post = pmin(pmax(FvFm_post / FvFm_initial, 1e-4), 1 - 1e-4))
+dat_std_p <- standardize_data(
+  p_dat, temp = "temp_C", duration = "time_min", proportion = "prop_post",
+  duration_unit = "minutes", random_effects = c("sp_id", "plant_id")
+)
+fit_p <- suppressWarnings(fit_4pl(dat_std_p, ctmax = ~0 + sp_id + (1|plant_id), z = ~0 + sp_id,
+                  up = ~0 + sp_id, family = "beta", t_ref = 60, method = "wald", quiet = TRUE))
+check_tls(fit_p)
+```
+
+```{r plot-secondary}
+plot_survival_curves(fit_p) +
+  scale_x_log10(breaks = dur_breaks) +
+  labs(title = NULL, subtitle = NULL,
+       x = "Exposure duration (min, log10 scale)",
+       y = "Fv/Fm proportion of baseline (2h / initial)")
+```
+
+```{r compare-p-o}
+bind_rows(
+  tls(fit_sp, by = "sp_id", method = "wald")$summary |> mutate(period = "overnight (24h)"),
+  tls(fit_p,  by = "sp_id", method = "wald")$summary |> mutate(period = "post-heat (2h)")
+) |>
+  filter(quantity == "CTmax") |>
+  select(sp_id, period, median, lower, upper) |>
+  pivot_wider(names_from = period, values_from = c(median, lower, upper))
+```
+
+Every species shows a higher CTmax overnight than at 2 h — highlighting
+consistent overnight recovery. This comparison is descriptive
+(two separately-fit curves); [Formal test of the recovery effect] below
+gives a statistical test of the same pattern.
+
+## Formal test of the recovery effect
+
+Stacking the 2 h and 24 h readings into one long dataset with a `period`
+factor lets `period` enter the model as an explicit term.
+
+A model with `sp_id x period` interaction (mirroring the per-species
+structure above) was attempted first, under both the proportional and
+absolute responses — both failed to converge due to overparameterization.
+The population-level model below — `period` as a fixed effect, `plant_id` 
+as a random intercept, no species term — is the model that converges, and
+directly answers the question: "is there an overall recovery effect?" 
+while accounting for repeated measures on the same plant.
+
+```{r joint-period-model}
+joint_dat <- bind_rows(
+  dat |> transmute(sp_id, plant_id, temp_C, time_min, period = "post",  prop = FvFm_post  / FvFm_initial),
+  dat |> transmute(sp_id, plant_id, temp_C, time_min, period = "final", prop = FvFm_final / FvFm_initial)
+) |>
+  mutate(period = factor(period, levels = c("post", "final")),
+         prop_clamped = pmin(pmax(prop, 1e-4), 1 - 1e-4))
+
+dat_std_joint <- standardize_data(
+  joint_dat, temp = "temp_C", duration = "time_min", proportion = "prop_clamped",
+  duration_unit = "minutes", random_effects = c("sp_id", "plant_id")
+)
+
+fit_joint <- fit_4pl(dat_std_joint, ctmax = ~1 + period + (1|plant_id), z = ~1 + period,
+                      family = "beta", t_ref = 60, method = "wald", quiet = TRUE)
+diagnose_tdt_fit(fit_joint)
+check_tls(fit_joint)
+tls(fit_joint, method = "wald")
+```
+
+`CTmax` is significantly higher at 24 h than at 2 h (non-overlapping Wald
+intervals) — a formal, population-level confirmation of the recovery effect
+visible in the per-species comparison above.
+
+## Recovery from acute stress: quantifying 2 h → 24 h change
+
+This section deliberately uses **absolute** Fv/Fm differences, not
+proportions — the question here ("how much Fv/Fm was regained overnight?")
+is naturally additive, not relative. Here we decompose recovery into acute
+damage, recoved, and irreparable from repeated measures in the same discs.
+Acute damage (`initial − post`) splits exactly into what recovered overnight 
+(`final − post`) and what remained lost at 24 h (`initial − final`).
+
+```{r decompose-recovery}
+rec <- dat |>
+  mutate(
+    acute_damage = FvFm_initial - FvFm_post,
+    recovered    = FvFm_final - FvFm_post,
+    irreparable  = FvFm_initial - FvFm_final
+  )
+```
+
+```{r plot-recovery-scatter}
+ggplot(rec, aes(temp_C, recovered, colour = sp_id)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_jitter(width = 1, alpha = 0.5, size = 1) +
+  geom_smooth(se = TRUE, span = 1.2) +
+  facet_wrap(~sp_id) +
+  scale_colour_viridis_d(option = "mako", end = 0.8) +
+  labs(x = "Temperature (°C)", y = "Δ Fv/Fm (24h − 2h)") +
+  theme(legend.position = "none")
+```
+
+Recovery peaks in the mid-range (roughly 35–44°C) and collapses toward zero
+at the most severe treatments (≥48°C). This indicates that repair capacity 
+is limited, exhausted, or tissue is destroyed by 2 h at the harshest doses.
+
+```{r plot-recovery-decompose}
+rec |>
+  group_by(temp_C, time_min) |>
+  summarise(recovered = mean(recovered), irreparable = mean(irreparable), .groups = "drop") |>
+  pivot_longer(c(recovered, irreparable), names_to = "component", values_to = "value") |>
+  mutate(component = factor(component, levels = c("irreparable", "recovered"),
+                             labels = c("Irreparable (still lost at 24h)",
+                                        "Recovered overnight (repairable)"))) |>
+  filter(value > 0) |> # removed negative change from baseline in repairable
+  ggplot(aes(factor(time_min), value, fill = component)) +
+  geom_col() +
+  scale_fill_viridis_d(option = "plasma", end = 0.8, direction = -1) +
+  facet_wrap(~temp_C, nrow = 1) +
+  labs(x = "Exposure duration (min)", y = "Mean Fv/Fm change from baseline", fill = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom")
+```
+
+Averaged across species and individuals, the repairable (blue) component is
+a real, non-trivial share of total damage at mild-to-moderate treatments
+(30–44°C) but is essentially exhausted from 48°C upward.
+
+Here we generate the figure reported in the main manscript, using combinations
+of plots shown above, with additional annotations.
+
+```{r plot-publication, fig.height = 6.5, fig.width = 9}
+
+p1 <-
+  plot_survival_curves(fit_sp) +
+  scale_x_log10(breaks = dur_breaks) +
+  scale_colour_viridis_d(name = "Temperature\n(°C)",
+                      option = "C", end = 0.9) +
+  facet_wrap(~group, ncol = 5) +
+  labs(title = NULL, subtitle = NULL, caption = NULL,
+       x = bquote("Exposure duration (min," ~ log[10] ~ scale * ")"),
+       y = bquote(atop(italic(F)[v] / italic(F)[m] ~ "proportion of", baseline ~ (24 ~ h / initial)))) +
+  theme_bw()
+
+p2 <-
+  plot_survival_surface(fit_sp, temps = seq(35, 50, 0.5)) +
+  scale_y_log10(breaks = dur_breaks) +
+  scale_fill_viridis_c(name = bquote(atop(italic(F)[v] / italic(F)[m] ~ "proportion of", baseline ~ (24 ~ h / initial))),
+                       option = "D",
+                       limits = c(0, 1)) +
+  facet_wrap(~group, ncol = 5) +
+  labs(title = NULL, subtitle = NULL, caption = NULL,
+       y = bquote(atop("Exposure duration", (min*"," ~ log[10] ~ scale)))) +
+  theme_bw()
+
+tls_labels <- tls(fit_sp, by = "sp_id", method = "wald")$summary |>
+  pivot_wider(names_from = quantity, values_from = c(median, lower, upper)) |>
+  transmute(group = sp_id,
+            label = sprintf("CTmax = %.1f°C\nz = %.2f", median_CTmax, median_z))
+
+p3 <-
+  suppressWarnings(plot_tdt_curve(fit_sp, p = 0.5, temps = seq(40, 52, length.out = 100))) +
+  scale_y_log10(breaks = c(1, 5, 15, 30, 60, 120, 240), limits = c(1,300)) +
+  scale_x_continuous(breaks = c(40,44,48), limits = c(40,50)) +
+  scale_colour_viridis_d(option = "mako", end = 0.8, name = "Species") +
+  facet_wrap(~group, ncol = 5) +
+  geom_text(data = tls_labels, aes(label = label), x = Inf, y = Inf,
+            hjust = 1.05, vjust = 1.4, inherit.aes = FALSE, size = 2.8) +
+  labs(title = NULL, subtitle = NULL, caption = NULL,
+       y = bquote(atop("Time to"~italic(T)[50], (min*"," ~ log[10] ~ scale)))) +
+  theme_bw()
+
+ggpubr::ggarrange(p1, p2, p3, ncol = 1, nrow = 3, align = "hv", labels = "auto")
+```
